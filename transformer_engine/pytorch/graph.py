@@ -357,6 +357,82 @@ def _make_graphed_callables(
 
     mempool = graph_pool_handle() if pool is None else pool
 
+    # === Graph memory tracking initialization ===
+    _graph_memory_stats = {
+        'fwd_graphs': {},  # idx -> {'mem_before': ..., 'mem_after': ..., 'mem_used': ...}
+        'bwd_graphs': {},  # idx -> {'mem_before': ..., 'mem_after': ..., 'mem_used': ...}
+        'mempool_initial': None,
+        'mempool_after_warmup': None,
+        'mempool_after_fwd_capture': None,
+        'mempool_final': None,
+        'mempool_handle': mempool,  # Store the mempool handle for later query
+    }
+
+    def _get_mempool_size(pool_handle):
+        """Get the actual size of a specific CUDA graph memory pool.
+
+        Args:
+            pool_handle: The pool handle returned by graph_pool_handle(), e.g. (0, 1)
+
+        Returns:
+            dict: {'total_size': ..., 'allocated_size': ..., 'num_segments': ...}
+        """
+        torch.cuda.synchronize()
+        snapshot = torch.cuda.memory_snapshot()
+
+        total_size = 0
+        allocated_size = 0
+        active_size = 0
+        num_segments = 0
+
+        for segment in snapshot:
+            seg_pool_id = segment.get('segment_pool_id', None)
+            if seg_pool_id == pool_handle:
+                total_size += segment.get('total_size', 0)
+                allocated_size += segment.get('allocated_size', 0)
+                active_size += segment.get('active_size', 0)
+                num_segments += 1
+
+        return {
+            'total_size': total_size,
+            'allocated_size': allocated_size,
+            'active_size': active_size,
+            'num_segments': num_segments,
+        }
+
+    def _record_graph_memory(graph_type, idx, phase):
+        """Record memory stats for a graph capture."""
+        torch.cuda.synchronize()
+        stats = torch.cuda.memory_stats()
+        mem_allocated = stats.get("allocated_bytes.all.current", 0)
+        mem_reserved = stats.get("reserved_bytes.all.current", 0)
+
+        if graph_type not in _graph_memory_stats:
+            _graph_memory_stats[graph_type] = {}
+        if idx not in _graph_memory_stats[graph_type]:
+            _graph_memory_stats[graph_type][idx] = {}
+
+        _graph_memory_stats[graph_type][idx][phase] = {
+            'allocated': mem_allocated,
+            'reserved': mem_reserved,
+        }
+
+        if phase == 'after':
+            before = _graph_memory_stats[graph_type][idx].get('before', {})
+            _graph_memory_stats[graph_type][idx]['mem_used'] = {
+                'allocated': mem_allocated - before.get('allocated', 0),
+                'reserved': mem_reserved - before.get('reserved', 0),
+            }
+
+    # Record initial mempool state
+    torch.cuda.synchronize()
+    _initial_stats = torch.cuda.memory_stats()
+    _graph_memory_stats['mempool_initial'] = {
+        'allocated': _initial_stats.get("allocated_bytes.all.current", 0),
+        'reserved': _initial_stats.get("reserved_bytes.all.current", 0),
+    }
+    # === End graph memory tracking initialization ===
+
     # Warmup
     # Hopefully prevents cudnn benchmarking and other lazy-initialization cuda work
     # from ending up in any captures.
@@ -486,6 +562,13 @@ def _make_graphed_callables(
                 if hasattr(module, "is_first_microbatch"):
                     module.is_first_microbatch = True
     torch.cuda.synchronize()
+
+    # Record mempool state after warmup (for tracking graph capture memory usage)
+    _warmup_stats = torch.cuda.memory_stats()
+    _graph_memory_stats['mempool_after_warmup'] = {
+        'allocated': _warmup_stats.get("allocated_bytes.all.current", 0),
+        'reserved': _warmup_stats.get("reserved_bytes.all.current", 0),
+    }
 
     # All captures here share a mempool. To avoid replays corrupting each other's memory,
     # the safest approach is to capture all passes in the same order they'll run:
@@ -915,6 +998,168 @@ def _make_graphed_callables(
         backward_dw_func, reset_func = make_graphed_attribute_functions(i)
         setattr(ret[-1], "backward_dw", backward_dw_func)
         setattr(ret[-1], "reset", reset_func)
+
+    # === Print memory pool and interface sizes (with deduplication) ===
+    def _format_size(size_bytes):
+        """Format bytes to human readable string."""
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if abs(size_bytes) < 1024.0:
+                return f"{size_bytes:.2f} {unit}"
+            size_bytes /= 1024.0
+        return f"{size_bytes:.2f} TB"
+
+    def _get_tensor_info(t):
+        """Get tensor info dict with size, dtype, shape, data_ptr."""
+        if t is None:
+            return None
+        if isinstance(t, torch.Tensor):
+            return {
+                'data_ptr': t.data_ptr(),
+                'size_bytes': t.numel() * t.element_size(),
+                'numel': t.numel(),
+                'dtype': str(t.dtype),
+                'shape': tuple(t.shape),
+                'device': str(t.device),
+            }
+        return None
+
+    def _collect_unique_tensors(tensor_lists, category_name):
+        """Collect unique tensors by data_ptr, return dict and stats."""
+        unique_tensors = {}  # data_ptr -> tensor_info
+        total_count = 0
+        duplicate_count = 0
+
+        for tensor_list in tensor_lists:
+            if tensor_list is None:
+                continue
+            tensors = tensor_list if hasattr(tensor_list, '__iter__') else [tensor_list]
+            for t in tensors:
+                info = _get_tensor_info(t)
+                if info is None:
+                    continue
+                total_count += 1
+                ptr = info['data_ptr']
+                if ptr in unique_tensors:
+                    duplicate_count += 1
+                else:
+                    unique_tensors[ptr] = info
+
+        return unique_tensors, total_count, duplicate_count
+
+    def _print_tensor_details(unique_tensors, title, max_items=1000):
+        """Print tensor details."""
+        print(f"\n  {title} (unique tensors: {len(unique_tensors)}):")
+        sorted_tensors = sorted(unique_tensors.values(), key=lambda x: -x['size_bytes'])
+        for i, info in enumerate(sorted_tensors[:max_items]):
+            print(f"    [{i}] shape={info['shape']}, dtype={info['dtype']}, "
+                  f"size={_format_size(info['size_bytes'])}")
+        if len(sorted_tensors) > max_items:
+            print(f"    ... and {len(sorted_tensors) - max_items} more tensors")
+        total_size = sum(info['size_bytes'] for info in unique_tensors.values())
+        print(f"    Total unique size: {_format_size(total_size)}")
+        return total_size
+
+    # Collect unique tensors for each category
+    # 1. Input surface (user args)
+    unique_user_args, user_args_count, user_args_dup = _collect_unique_tensors(
+        flatten_sample_args, "user_args"
+    )
+
+    # 2. Input surface (module params)
+    unique_params, params_count, params_dup = _collect_unique_tensors(
+        per_callable_module_params, "module_params"
+    )
+
+    # 3. Output surface
+    unique_outputs, outputs_count, outputs_dup = _collect_unique_tensors(
+        per_callable_static_outputs, "outputs"
+    )
+
+    # 4. Grad outputs
+    unique_grad_outputs, grad_outputs_count, grad_outputs_dup = _collect_unique_tensors(
+        per_callable_static_grad_outputs, "grad_outputs"
+    )
+
+    # 5. Grad inputs
+    unique_grad_inputs, grad_inputs_count, grad_inputs_dup = _collect_unique_tensors(
+        per_callable_static_grad_inputs, "grad_inputs"
+    )
+
+    # Calculate CUDA Graph mempool size
+    # The mempool size is the difference between current reserved memory and the memory
+    # reserved before graph capture started (recorded in _graph_memory_stats)
+    torch.cuda.synchronize()
+    mem_stats_final = torch.cuda.memory_stats()
+    mem_allocated_final = mem_stats_final.get("allocated_bytes.all.current", 0)
+    mem_reserved_final = mem_stats_final.get("reserved_bytes.all.current", 0)
+
+    # Get mempool usage from tracked stats
+    mempool_initial = _graph_memory_stats.get('mempool_initial', {})
+    mempool_after_warmup = _graph_memory_stats.get('mempool_after_warmup', {})
+
+    cudagraph_mempool_allocated = mem_allocated_final - mempool_after_warmup.get('allocated', 0)
+    cudagraph_mempool_reserved = mem_reserved_final - mempool_after_warmup.get('reserved', 0)
+    warmup_mem_increase = mempool_after_warmup.get('allocated', 0) - mempool_initial.get('allocated', 0)
+
+    print("=" * 100)
+    print("TE make_graphed_callables - CUDA Graph Memory Statistics (Deduplicated)")
+    print("=" * 100)
+    print(f"Number of graphs captured: {len(ret)} (fwd) + {len(ret)} (bwd) = {len(ret) * 2} total")
+    print(f"Number of callables: {len(callables)}")
+    if _order is not None:
+        print(f"Pipeline order length: {len(_order)}, num_microbatches: {num_microbatches}")
+
+    print("-" * 100)
+    print("STATIC INPUT SURFACE (sample_args + module_params):")
+    user_args_size = _print_tensor_details(unique_user_args,
+        f"User Args (total refs: {user_args_count}, duplicates: {user_args_dup})")
+    params_size = _print_tensor_details(unique_params,
+        f"Module Params (total refs: {params_count}, duplicates: {params_dup})")
+    print(f"\n  Combined unique input surface: {_format_size(user_args_size + params_size)}")
+
+    print("-" * 100)
+    print("STATIC OUTPUT SURFACE:")
+    output_size = _print_tensor_details(unique_outputs,
+        f"Outputs (total refs: {outputs_count}, duplicates: {outputs_dup})")
+
+    print("-" * 100)
+    print("GRADIENT SURFACES (for backward):")
+    grad_out_size = _print_tensor_details(unique_grad_outputs,
+        f"Grad Outputs (total refs: {grad_outputs_count}, duplicates: {grad_outputs_dup})")
+    grad_in_size = _print_tensor_details(unique_grad_inputs,
+        f"Grad Inputs (total refs: {grad_inputs_count}, duplicates: {grad_inputs_dup})")
+
+    print("-" * 100)
+    print("CUDA GRAPH MEMPOOL USAGE (graph capture only, excluding warmup):")
+    print(f"  Memory before warmup:        allocated={_format_size(mempool_initial.get('allocated', 0))}, "
+          f"reserved={_format_size(mempool_initial.get('reserved', 0))}")
+    print(f"  Memory after warmup:         allocated={_format_size(mempool_after_warmup.get('allocated', 0))}, "
+          f"reserved={_format_size(mempool_after_warmup.get('reserved', 0))}")
+    print(f"  Memory after graph capture:  allocated={_format_size(mem_allocated_final)}, "
+          f"reserved={_format_size(mem_reserved_final)}")
+    print(f"  Warmup memory increase:      {_format_size(warmup_mem_increase)}")
+    print(f"  CUDA Graph mempool (diff):   allocated={_format_size(cudagraph_mempool_allocated)}, "
+          f"reserved={_format_size(cudagraph_mempool_reserved)}")
+
+    # Get actual mempool size using memory_snapshot
+    print("-" * 100)
+    print("CUDA GRAPH MEMPOOL (Actual Size from memory_snapshot):")
+    mempool_handle = _graph_memory_stats.get('mempool_handle', mempool)
+    actual_mempool = _get_mempool_size(mempool_handle)
+    print(f"  Mempool handle:              {mempool_handle}")
+    print(f"  Total size (reserved):       {_format_size(actual_mempool['total_size'])}")
+    print(f"  Allocated size:              {_format_size(actual_mempool['allocated_size'])}")
+    print(f"  Active size:                 {_format_size(actual_mempool['active_size'])}")
+    print(f"  Number of segments:          {actual_mempool['num_segments']}")
+
+    print("-" * 100)
+    print("SUMMARY (unique memory only):")
+    total_static_buffers = user_args_size + output_size + grad_out_size + grad_in_size
+    print(f"  Static buffers (excl. params): {_format_size(total_static_buffers)}")
+    print(f"  Module parameters:             {_format_size(params_size)}")
+    print(f"  CUDA Graph mempool (actual):   {_format_size(actual_mempool['total_size'])}")
+    print("=" * 100)
+    # === End of memory pool and interface sizes printing ===
 
     if just_one_callable:
         return ret[0]
